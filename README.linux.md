@@ -25,8 +25,10 @@
 | `shape.py` | **点击区裁剪 + 置顶保活 + 隐藏任务栏条目**。需要 `python-xlib`（`xenv/` 里装好了）。用法：`python shape.py`，可传 `左 宽 上 高`（占窗口比例，默认 `0.10 0.52 0.03 0.70` 是上游旧的宽松值；本仓库实测收紧到 `0.355+x15 / 0.28-30 / 0.29+15 / 0.40-30`） |
 | `watch.js` | **让她说话 + 陪看陪玩**：轮询 `/dsh-pet-7340/state` 把她气泡里的字用 edge-tts 念出来；定时截屏 → DeepSeek 视觉 → 用 `/broadcast` 投到她气泡上（游戏 75s / 视频 100s 各最多一句） |
 | `fishie-del.js` | **桌面文件操作**：算 KDE 桌面图标坐标 → 让她走过去 → 播「被鼠标拖拽悬空反馈」→ `gio trash`（进回收站，可恢复）→ 说话 |
-| `apply-patches.sh` | 如果你仍想用 npm 装的 `dsh-pet`，这个脚本把上述补丁幂等地打进已安装的 `lib/`（上游更新后重跑一次） |
+| `install-local.sh` | 一条命令装进 profile：把本仓库的 `lib/`、`runtime/` `rsync --delete` 覆盖到 `~/.dsh/profiles/web/node_modules/dsh-pet/`（先装过 npm 版才有目录） |
+| `apply-patches.sh` | 不想覆盖整个 `lib/` 时用这个：把上述补丁幂等地打进 npm 已安装版的 `lib/`（上游更新后重跑一次） |
 | `restart-dsh.sh` | 重启 `dsh web`（装完插件/改完配置后让客户端重新加载） |
+| `push.sh` | 把本仓库推到自己的 fork（`sh linux-sidecar/push.sh git@github.com:<你>/dsh-pet-linux.git`） |
 
 ### 指令桥（她听得懂"帮我删掉桌面的 XXX"）
 
@@ -37,22 +39,43 @@
 
 ---
 
-## 安装（本地版）
+## 安装
+
+### 从本仓库装（推荐）
 
 ```bash
-# 1) 放到 DSH profile 的 node_modules（或直接用 apply-patches.sh 打补丁到 npm 已安装版）
-cp -r . ~/.dsh/profiles/web/node_modules/dsh-pet
+# 0) 前提：profile 里已经装过一次 dsh-pet（本分支只覆盖它的运行时）
+dsh plugin --profile web add dsh-pet
 
-# 2) 起 sidecar（两个都建议开机自启）
+git clone git@github.com:ko5521317-sys/dsh-pet-linux.git
+cd dsh-pet-linux
+
+# 1) 覆盖 lib/ 与 runtime/（只动运行时代码，assets 不碰）
+sh linux-sidecar/install-local.sh
+
+# 2) sidecar 的 python 依赖（shape.py 用）
 python3 -m venv linux-sidecar/xenv && linux-sidecar/xenv/bin/pip install python-xlib
+
+# 3) 起两个 sidecar（建议都做成开机自启）
 linux-sidecar/xenv/bin/python linux-sidecar/shape.py &
 node linux-sidecar/watch.js &
 
-# 3) 重启 DSH 让插件客户端加载
+# 4) 重启 DSH 让插件客户端重新加载
 sh linux-sidecar/restart-dsh.sh
 ```
 
-自启别忘了 `~/.config/autostart/` 里放两个 `.desktop`（见仓库里的示例）。
+`watch.js` 里的路径/音色/视觉节流都在文件顶部常量区，改完重启它即可。
+自启可以在 `~/.config/autostart/` 放两个 `.desktop`，`Exec` 里 `sleep 25` 等 DSH 起来。
+
+### 手动版（等价）
+
+```bash
+cp -r . ~/.dsh/profiles/web/node_modules/dsh-pet
+python3 -m venv linux-sidecar/xenv && linux-sidecar/xenv/bin/pip install python-xlib
+linux-sidecar/xenv/bin/python linux-sidecar/shape.py &
+node linux-sidecar/watch.js &
+sh linux-sidecar/restart-dsh.sh
+```
 
 ## 已知限制
 
@@ -68,3 +91,19 @@ sh linux-sidecar/restart-dsh.sh
 
 本仓库 = 上游 `0.3.8` 的 `lib/`（运行时代码）+ 上面的 Linux 补丁 + `linux-sidecar/`。
 **不打算跟随上游更新**：上游改 Linux 相关逻辑时再来挑；需要新功能就手动 merge。
+
+## 踩坑：`git push` 报 `Connection closed by ... port 22`
+
+国内网络对 GitHub 的 22 端口时通时断（`Permission denied (publickey)` 也可能是它伪装出来的）。
+走 443 就好，`~/.ssh/config` 加一段：
+
+```
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  User git
+  IdentityFile ~/.ssh/id_ed25519_github
+  IdentitiesOnly yes
+```
+
+先用 `ssh -T -p 443 git@ssh.github.com` 验证能通（回 `Hi <用户名>!` 才对），再 `git push`。
