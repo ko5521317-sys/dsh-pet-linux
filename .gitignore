@@ -1,0 +1,3 @@
+node_modules/
+linux-sidecar/xenv/
+*.log
