@@ -1,3 +1,13 @@
+# dsh-pet-linux 🐾🐧
+
+> **这是 [`dsh-pet`](https://github.com/PC2005-cloud/dsh-pet) 的 Linux 修复分支**（基线 `dsh-pet@0.3.8`）。
+> 上游在 Windows / macOS 上没问题，在 Linux 上会「点不动、拦鼠标、任务栏多个 X、每次启动弹崩溃框」——
+> 本分支把这几条都修了，另外附了语音 / 陪看陪玩 / 桌面文件操作的 sidecar。
+> **Linux 用户请看 👉 [`README.linux.md`](README.linux.md)**（修了什么、怎么装、已知限制），变更记录见 [`CHANGELOG.linux.md`](CHANGELOG.linux.md)。
+> 下面是上游原始 README，Windows / macOS 用户可直接照它来。
+
+---
+
 # dsh-pet 🐾
 
 <p align="center">
