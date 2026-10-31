@@ -33,7 +33,12 @@ const DEFAULTS = {
   watchIntervalSec: 100,
   gameIntervalSec: 75,
   onlyWhenMedia: true,
+  visionMode: 'local', // local = 只截前台窗口 + 本机 OCR + 本机模型；cloud = 整屏截图 + DeepSeek 视觉
+  visionFallback: false, // local 没话说时要不要退回云端（会花 token，默认关）
   visionModel: 'deepseek-flash',
+  ollama: 'http://127.0.0.1:11434',
+  localModel: 'qwen3:4b-instruct-2507-q4_K_M',
+  localThreads: 8,
   ttsPython: path.join(HOME, '.openclaw', 'projects', 'fishgirl', 'pyenv', 'bin', 'python'),
   ttsScript: path.join(HOME, '.openclaw', 'projects', 'fishgirl', 'python', 'tts.py'),
 };
@@ -196,17 +201,55 @@ function grabScreen() {
 }
 
 const recent = [];
+
+// —— 把一条「反应」投到她气泡上（本地档 / 云端档共用）
+async function publishVision(tag, text) {
+  text = String(text || '').replace(/\[\[[^\]]*\]\]/g, '').replace(/^["「『]|["」』]$/g, '').trim();
+  if (text.length < 2 || /^SKIP/i.test(text)) return;
+  recent.push(text);
+  while (recent.length > 4) recent.shift();
+  log('comment:', tag ? `[${tag}] ` : '', text);
+  await fetch(`${conf.base}/dsh-pet-7340/broadcast?pet=${encodeURIComponent(conf.pet)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, duration: 12000 }),
+    signal: AbortSignal.timeout(8000),
+  }).catch((e) => log('broadcast failed', e.message));
+}
+
+function avoidLine() {
+  return recent.length ? `刚才说过这些，别重复：${recent.map((x) => '「' + x + '」').join('')}` : '';
+}
+
+function splitTag(text) {
+  const s = String(text || '').trim().replace(/^["「『]|["」』]$/g, '');
+  const m = s.match(/^([^|｜\n]{1,6})[|｜](.+)$/s);
+  return m ? { tag: m[1].trim(), text: m[2].trim() } : { tag: '', text: s };
+}
+
 async function visionTick() {
-  const key = deepseekKey();
-  if (!key) return;
   const title = await activeWindowTitle();
   const isGame = GAME_HINTS.test(title);
   const isMedia = MEDIA_HINTS.test(title);
   if (conf.onlyWhenMedia && !isGame && !isMedia) return;
+  const mode = conf.visionMode || 'local';
+  const one = mode === 'cloud' ? await cloudVision(title, isGame) : await localVision(title, isGame);
+  if ((!one || !one.text) && mode !== 'cloud' && conf.visionFallback) {
+    const alt = await cloudVision(title, isGame);
+    if (alt && alt.text) await publishVision(alt.tag, alt.text);
+    return;
+  }
+  if (one && one.text) await publishVision(one.tag, one.text);
+}
+
+// ---------------------------------------------------------------- 云端档：整屏截图 → DeepSeek 视觉
+async function cloudVision(title, isGame) {
+  const key = deepseekKey();
+  if (!key) return null;
   const shot = await grabScreen();
-  if (!shot) return;
+  if (!shot) return null;
   const b64 = shot.toString('base64');
-  const avoid = recent.length ? `刚才说过这些，别重复：${recent.map((x) => '「' + x + '」').join('')}` : '';
+  const avoid = avoidLine();
   const prompt = isGame
     ? `你正坐在主人旁边看他打游戏。当前窗口标题：「${title}」。
 先判断情境，从这些标签里挑一个放最前：低血 / 濒死 / 死亡 / 击杀 / 胜利 / BOSS / 打怪 / 探索 / 卡关 / 过场 / 菜单 / 翻车
@@ -234,29 +277,167 @@ ${avoid}
       }),
       signal: AbortSignal.timeout(45000),
     });
-    if (!r.ok) return log('vision http', r.status);
-    const j = await r.json();
-    let text = (j.choices?.[0]?.message?.content || '').trim();
-    if (!text || /^SKIP/i.test(text)) return;
-    let tag = '';
-    const m = text.match(/^([^|｜]{1,6})[|｜](.+)$/s);
-    if (m) {
-      tag = m[1].trim();
-      text = m[2].trim();
+    if (!r.ok) {
+      log('vision http', r.status);
+      return null;
     }
-    if (text.length < 2) return;
-    recent.push(text);
-    while (recent.length > 4) recent.shift();
-    log('comment:', tag ? `[${tag}] ` : '', text);
-    // 投到她气泡上（她自己的渲染 + 我们的 TTS 都会用上）
-    await fetch(`${conf.base}/dsh-pet-7340/broadcast?pet=${encodeURIComponent(conf.pet)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, duration: 12000 }),
-      signal: AbortSignal.timeout(8000),
-    }).catch((e) => log('broadcast failed', e.message));
+    const j = await r.json();
+    return splitTag((j.choices?.[0]?.message?.content || '').trim());
   } catch (e) {
     log('vision failed', e.message ? e.message.slice(0, 140) : String(e));
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------- 本地档：只截前台窗口 → OCR → 本机 4B
+const OLLAMA_BASE = String(conf.ollama || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+const LOCAL_MODEL = conf.localModel || 'qwen3:4b-instruct-2507-q4_K_M';
+const OCR_PY = path.join(CONF_DIR, 'xenv', 'bin', 'python');
+const OCR_SCRIPT = path.join(CONF_DIR, 'ocr.py');
+
+let SCREEN = null;
+function screenSize() {
+  if (SCREEN) return Promise.resolve(SCREEN);
+  return new Promise((resolve) => {
+    execFile('xrandr', [], { timeout: 3000 }, (err, out) => {
+      const m = !err && String(out).match(/current\s+(\d+)\s*x\s*(\d+)/);
+      SCREEN = m ? { w: parseInt(m[1], 10), h: parseInt(m[2], 10) } : { w: 1920, h: 1080 };
+      resolve(SCREEN);
+    });
+  });
+}
+
+function activeWindowInfo() {
+  return new Promise((resolve) => {
+    execFile('xdotool', ['getactivewindow'], { timeout: 3000 }, (err, out) => {
+      if (err) return resolve(null);
+      const id = String(out).trim();
+      if (!id) return resolve(null);
+      execFile('xwininfo', ['-id', id], { timeout: 3000 }, (e2, o2) => {
+        if (e2) return resolve(null);
+        const n = (re) => {
+          const m = String(o2).match(re);
+          return m ? parseInt(m[1], 10) : null;
+        };
+        resolve({
+          id,
+          x: n(/Absolute upper-left X:\s+(-?\d+)/),
+          y: n(/Absolute upper-left Y:\s+(-?\d+)/),
+          w: n(/Width:\s+(\d+)/),
+          h: n(/Height:\s+(\d+)/),
+        });
+      });
+    });
+  });
+}
+
+// 只截前台窗口那一块（图不出本机，也不需要），窗口信息拿不到就退回整屏
+async function grabWindow(geo) {
+  const s = await screenSize();
+  let x = Math.max(0, Math.min(geo.x ?? 0, s.w - 64));
+  let y = Math.max(0, Math.min(geo.y ?? 0, s.h - 64));
+  let w = geo.w && geo.w > 240 ? geo.w : s.w - x;
+  let h = geo.h && geo.h > 160 ? geo.h : s.h - y;
+  w = Math.min(w, s.w - x);
+  h = Math.min(h, s.h - y);
+  if (w < 200 || h < 120) {
+    x = 0;
+    y = 0;
+    w = s.w;
+    h = s.h;
+  }
+  const out = path.join(TMP, `ocr-${Date.now()}.png`);
+  return new Promise((resolve) => {
+    const args = ['-v', 'error', '-y', '-f', 'x11grab', '-video_size', `${w}x${h}`, '-i', `${process.env.DISPLAY || ':0'}.0+${x},${y}`,
+      '-frames:v', '1', '-vf', 'scale=1280:-1', out];
+    execFile('ffmpeg', args, { timeout: 9000 }, (e) => resolve(e ? null : out));
+  });
+}
+
+function ocrImage(file) {
+  return new Promise((resolve) => {
+    execFile(OCR_PY, [OCR_SCRIPT, file], { timeout: 30000, env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' } }, (err, out) => {
+      try {
+        fs.unlink(file, () => {});
+      } catch {}
+      resolve(err ? '' : String(out || '').trim());
+    });
+  });
+}
+
+function localGenerate(prompt, numPredict = 80) {
+  return new Promise((resolve) => {
+    fetch(`${OLLAMA_BASE}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: LOCAL_MODEL,
+        prompt,
+        stream: false,
+        keep_alive: '30m',
+        options: { num_predict: numPredict, temperature: 1.0, num_thread: conf.localThreads || 8, num_ctx: 2048 },
+      }),
+      signal: AbortSignal.timeout(60000),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => resolve(j ? String(j.response || '') : null))
+      .catch(() => resolve(null));
+  });
+}
+
+async function localVision(title, isGame) {
+  if (/dsh-pet/i.test(title || '')) return null;
+  const t0 = Date.now();
+  const geo = (await activeWindowInfo()) || {};
+  const img = await grabWindow(geo);
+  const t1 = Date.now();
+  if (!img) {
+    log('local: 截不到图');
+    return null;
+  }
+  const raw = await ocrImage(img);
+  const t2 = Date.now();
+  const text = raw.replace(/\n{2,}/g, '\n').slice(0, 500);
+  if (text.replace(/\s/g, '').length < 8) {
+    log('local: OCR 没读出字，跳过');
+    return null;
+  }
+  const avoid = avoidLine();
+  const prompt = isGame
+    ? `你是「大肥鱼」，Q版蓝发小女仆，正坐在主人旁边看他打游戏。语气要嗨、要短、口语化。
+窗口标题：${title}
+屏幕上的字（OCR 认的，可能有错别字，别评论文字本身）：
+${text}
+${avoid}
+先挑一个情境标签（低血/濒死/死亡/击杀/胜利/BOSS/打怪/探索/卡关/过场/菜单/翻车），再写 8~24 字台词，必须提到屏幕上的具体东西。
+只输出一行，格式：标签|台词。没话说只输出 SKIP。`
+    : `你是「大肥鱼」，Q版蓝发小女仆，正陪主人看屏幕。用她的口吻说一句 15~30 字的即时反应（吐槽/惊讶/接话），要口语化、要具体。
+窗口标题：${title}
+屏幕上的字（OCR 认的，可能有错别字，别评论文字本身）：
+${text}
+${avoid}
+只输出这一句话。没话说只输出 SKIP。`;
+  const reply = await localGenerate(prompt);
+  const t3 = Date.now();
+  if (!reply) {
+    log('local: 模型没回话（ollama 起了吗？）');
+    return null;
+  }
+  log(`local 耗时 截${t1 - t0}ms 认字${t2 - t1}ms 模型${t3 - t2}ms | 字${text.length}个`);
+  return splitTag(reply);
+}
+
+// 预热：模型 5 分钟不用会被卸载，冷启动要 3.7 秒
+let warmOk = null;
+async function warmLocal(quiet) {
+  if ((conf.visionMode || 'local') !== 'local' || !conf.watch) return;
+  const r = await localGenerate('在吗', 1);
+  const ok = r !== null;
+  if (ok !== warmOk) {
+    log('本地模型' + (ok ? '预热 ok' : '预热失败（ollama 没起来？）'), LOCAL_MODEL);
+    warmOk = ok;
+  } else if (!quiet) {
+    log('本地模型预热 ok');
   }
 }
 
@@ -293,9 +474,24 @@ async function maybeVision() {
   }
 }
 
-log('fishie-voice started', { speak: conf.speak, watch: conf.watch, voice: conf.voice });
-setInterval(pollSay, 700);
-setInterval(maybeVision, 15000);
-setTimeout(maybeVision, 4000);
+log('fishie-voice started', { speak: conf.speak, watch: conf.watch, voice: conf.voice, vision: conf.visionMode || 'local', localModel: conf.localModel });
+
+// 调试用：node watch.js --once 只跑一趟「看」，把结果打出来就退出（不念、不发）
+if (process.argv.includes('--once')) {
+  (async () => {
+    const t0 = Date.now();
+    const title = await activeWindowTitle();
+    const one = (conf.visionMode || 'local') === 'cloud' ? await cloudVision(title, GAME_HINTS.test(title)) : await localVision(title, GAME_HINTS.test(title));
+    console.log(JSON.stringify({ title, window: title, result: one, ms: Date.now() - t0 }, null, 2));
+    process.exit(0);
+  })();
+} else {
+  setInterval(pollSay, 700);
+  setInterval(maybeVision, 15000);
+  setTimeout(maybeVision, 4000);
+  // 本地档：起来先预热模型，之后每 4 分钟摸一下，别让它被 ollama 卸载（冷启动 3.7s）
+  setTimeout(() => warmLocal(false), 8000);
+  setInterval(() => warmLocal(true), 240000);
+}
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));

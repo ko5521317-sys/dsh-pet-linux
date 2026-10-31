@@ -1,0 +1,22 @@
+{
+  "base": "http://127.0.0.1:3080",
+  "pet": "main",
+  "voice": "zh-CN-XiaoyiNeural",
+  "rate": "+6%",
+  "pitch": 3,
+  "speak": true,
+  "watch": true,
+  "watchIntervalSec": 100,
+  "gameIntervalSec": 75,
+  "onlyWhenMedia": true,
+
+  "visionMode": "local",
+  "visionFallback": false,
+  "visionModel": "deepseek-flash",
+  "ollama": "http://127.0.0.1:11434",
+  "localModel": "qwen3:4b-instruct-2507-q4_K_M",
+  "localThreads": 12,
+
+  "ttsPython": "/home/你/.openclaw/projects/fishgirl/pyenv/bin/python",
+  "ttsScript": "/home/你/.openclaw/projects/fishgirl/python/tts.py"
+}

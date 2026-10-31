@@ -1,5 +1,22 @@
 # Linux 分支变更记录
 
+## 2026-11-01 本地档：不花 token、截图不出本机
+
+- feat(sidecar): `watch.js` 的"看"拆成两档，`config.json` 的 `visionMode` 切：
+  - `local`（默认）：只截**前台窗口那一块** → 本机 OCR 认字 → 本机 4B 模型说一句。
+    截图不落盘、不出网；不烧 token。
+  - `cloud`：原来的整屏截图 + DeepSeek 视觉（更懂画面，但每张图约 1k 输入 token）。
+- feat(sidecar): `ocr.py` —— 认字，优先 RapidOCR（屏幕字更准），退化到 tesseract + 本地
+  `chi_sim` 语言包（不需要 sudo 装系统语言包）。
+- feat(sidecar): `watch.js --once` —— 只跑一趟"截窗口 → OCR → 模型"并打印结果，用来验收。
+- feat(sidecar): 本地模型预热 + 每 4 分钟 keep-alive，避免 ollama 卸载后 3.7s 冷启动。
+- feat(sidecar): `visionFallback`（默认关）—— 本地档没话说时是否退回云端；默认关，
+  因为游戏画面字少，退回云端等于每一句都在花钱。
+- feat(sidecar): `config.example.json`，列出全部可调项与默认值。
+- fix(ctl): `fishie-voice-ctl.sh` 改用 pidfile，不再用 `pgrep -f` 模糊匹配
+  （它会把调用者自己的命令行也算进去，误判"已经在跑"、误杀 shell）。
+- perf: 生成 18~20 tok/s、一句话 1.6s、模型常驻 2.9~3.2 GB（Ryzen AI 9 HX 370，纯 CPU）。
+
 ## 2026-10-31 初始分支（基于 dsh-pet 0.3.8）
 
 - fix(runtime): Linux 上 `setWindowIgnore()` 不再调用 Electron `setIgnoreMouseEvents`
