@@ -227,11 +227,14 @@ function splitTag(text) {
   return m ? { tag: m[1].trim(), text: m[2].trim() } : { tag: '', text: s };
 }
 
+let lastRealVisionAt = 0; // 上一次真的看了屏幕（不是"检查了一下但没看"）
+
 async function visionTick() {
   const title = await activeWindowTitle();
   const isGame = GAME_HINTS.test(title);
   const isMedia = MEDIA_HINTS.test(title);
   if (conf.onlyWhenMedia && !isGame && !isMedia) return;
+  lastRealVisionAt = Date.now();
   const mode = conf.visionMode || 'local';
   const one = mode === 'cloud' ? await cloudVision(title, isGame) : await localVision(title, isGame);
   if ((!one || !one.text) && mode !== 'cloud' && conf.visionFallback) {
@@ -332,7 +335,9 @@ function activeWindowInfo() {
 }
 
 // 只截前台窗口那一块（图不出本机，也不需要），窗口信息拿不到就退回整屏
-async function grabWindow(geo) {
+const BROWSER_HINTS = /(Firefox|Chrome|Chromium|Edge|Brave|Opera|Vivaldi)/i;
+
+async function grabWindow(geo, cropTop = 0) {
   const s = await screenSize();
   let x = Math.max(0, Math.min(geo.x ?? 0, s.w - 64));
   let y = Math.max(0, Math.min(geo.y ?? 0, s.h - 64));
@@ -348,8 +353,10 @@ async function grabWindow(geo) {
   }
   const out = path.join(TMP, `ocr-${Date.now()}.png`);
   return new Promise((resolve) => {
+    // 浏览器把标签栏也截进去了：她念的全是别的标签页标题，主体内容一个字没读
+    const vf = cropTop > 0 && h > cropTop + 240 ? `crop=iw:ih-${cropTop}:0:${cropTop},scale=1280:-1` : 'scale=1280:-1';
     const args = ['-v', 'error', '-y', '-f', 'x11grab', '-video_size', `${w}x${h}`, '-i', `${process.env.DISPLAY || ':0'}.0+${x},${y}`,
-      '-frames:v', '1', '-vf', 'scale=1280:-1', out];
+      '-frames:v', '1', '-vf', vf, out];
     execFile('ffmpeg', args, { timeout: 9000 }, (e) => resolve(e ? null : out));
   });
 }
@@ -389,7 +396,7 @@ async function localVision(title, isGame) {
   if (/dsh-pet/i.test(title || '')) return null;
   const t0 = Date.now();
   const geo = (await activeWindowInfo()) || {};
-  const img = await grabWindow(geo);
+  const img = await grabWindow(geo, BROWSER_HINTS.test(title || '') ? 96 : 0);
   const t1 = Date.now();
   if (!img) {
     log('local: 截不到图');
@@ -397,7 +404,7 @@ async function localVision(title, isGame) {
   }
   const raw = await ocrImage(img);
   const t2 = Date.now();
-  const text = raw.replace(/\n{2,}/g, '\n').slice(0, 500);
+  const text = raw.replace(/\n{2,}/g, '\n').slice(0, 420);
   if (text.replace(/\s/g, '').length < 8) {
     log('local: OCR 没读出字，跳过');
     return null;
@@ -406,14 +413,14 @@ async function localVision(title, isGame) {
   const prompt = isGame
     ? `你是「大肥鱼」，Q版蓝发小女仆，正坐在主人旁边看他打游戏。语气要嗨、要短、口语化。
 窗口标题：${title}
-屏幕上的字（OCR 认的，可能有错别字，别评论文字本身）：
+屏幕上的字（OCR 结果，有错别字或乱码，直接忽略、不准挑错，只看内容在讲什么）：
 ${text}
 ${avoid}
-先挑一个情境标签（低血/濒死/死亡/击杀/胜利/BOSS/打怪/探索/卡关/过场/菜单/翻车），再写 8~24 字台词，必须提到屏幕上的具体东西。
+先挑一个情境标签（低血/濒死/死亡/击杀/胜利/BOSS/打怪/探索/卡关/过场/菜单/翻车），再写 8~24 字台词，要提到具体的东西。
 只输出一行，格式：标签|台词。没话说只输出 SKIP。`
     : `你是「大肥鱼」，Q版蓝发小女仆，正陪主人看屏幕。用她的口吻说一句 15~30 字的即时反应（吐槽/惊讶/接话），要口语化、要具体。
 窗口标题：${title}
-屏幕上的字（OCR 认的，可能有错别字，别评论文字本身）：
+屏幕上的字（OCR 结果，有错别字或乱码，直接忽略、不准挑错，只看内容在讲什么）：
 ${text}
 ${avoid}
 只输出这一句话。没话说只输出 SKIP。`;
@@ -450,8 +457,9 @@ async function pollSay() {
     const say = j?.pets?.[conf.pet]?.say;
     if (!say || !say.data || !say.data.text) return;
     if (say.counter && say.counter !== lastSayCounter) {
+      const first = lastSayCounter === 0; // 刚起来：气泡里是上一轮的旧话，别当成新指令（不然重启就重放一次删除）
       lastSayCounter = say.counter;
-      handleSay(String(say.data.text).trim()).catch((e) => log('handleSay error', e.message));
+      if (!first) handleSay(String(say.data.text).trim()).catch((e) => log('handleSay error', e.message));
     }
   } catch {}
 }
@@ -491,7 +499,11 @@ if (process.argv.includes('--once')) {
   setTimeout(maybeVision, 4000);
   // 本地档：起来先预热模型，之后每 4 分钟摸一下，别让它被 ollama 卸载（冷启动 3.7s）
   setTimeout(() => warmLocal(false), 8000);
-  setInterval(() => warmLocal(true), 240000);
+  // 只有最近看过屏幕才续命，否则让她把 2.9 GB 内存还回来
+  setInterval(() => {
+    if (Date.now() - lastRealVisionAt > 15 * 60 * 1000) return;
+    warmLocal(true);
+  }, 240000);
 }
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
